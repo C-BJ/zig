@@ -61,6 +61,8 @@ end_di_column: u32,
 /// which is a relative jump, based on the address following the reloc.
 exitlude_jump_relocs: std.ArrayListUnmanaged(Mir.Inst.Index) = .{},
 
+stack_args_relocs: std.ArrayListUnmanaged(Mir.Inst.Index) = .{},
+
 /// Whenever there is a runtime branch, we push a Branch onto this stack,
 /// and pop it off when the runtime branch joins. This provides an "overlay"
 /// of the table of mappings from instructions to `MCValue` from within the branch.
@@ -284,6 +286,7 @@ pub fn generate(
     defer function.exitlude_jump_relocs.deinit(bin_file.allocator);
     defer function.mir_instructions.deinit(bin_file.allocator);
     defer function.mir_extra.deinit(bin_file.allocator);
+    defer function.stack_args_relocs.deinit(bin_file.allocator);
     defer if (builtin.mode == .Debug) function.mir_to_air_map.deinit();
 
     var call_info = function.resolveCallingConventionValues(fn_type) catch |err| switch (err) {
@@ -492,20 +495,25 @@ fn gen(self: *Self) InnerError!void {
         }
         const aligned_stack_end = mem.alignForward(stack_end, self.stack_align);
         if (aligned_stack_end > 0 or stack_adjustment > 0) {
+            const imm = @bitCast(u32, @intCast(i32, aligned_stack_end) + stack_adjustment);
             self.mir_instructions.set(backpatch_stack_sub, .{
                 .tag = .sub,
                 .ops = (Mir.Ops{
                     .reg1 = .rsp,
                 }).encode(),
-                .data = .{ .imm = @bitCast(u32, @intCast(i32, aligned_stack_end) + stack_adjustment) },
+                .data = .{ .imm = imm },
             });
             self.mir_instructions.set(backpatch_stack_add, .{
                 .tag = .add,
                 .ops = (Mir.Ops{
                     .reg1 = .rsp,
                 }).encode(),
-                .data = .{ .imm = @bitCast(u32, @intCast(i32, aligned_stack_end) + stack_adjustment) },
+                .data = .{ .imm = imm },
             });
+
+            while (self.stack_args_relocs.popOrNull()) |index| {
+                self.mir_instructions.items(.data)[index].imm += imm;
+            }
         }
     } else {
         _ = try self.addInst(.{
@@ -2156,9 +2164,6 @@ fn airArg(self: *Self, inst: Air.Inst.Index) !void {
     const arg_index = self.arg_index;
     self.arg_index += 1;
 
-    const ty = self.air.typeOfIndex(inst);
-    _ = ty;
-
     const mcv = self.args[arg_index];
     const payload = try self.addExtra(Mir.ArgDbgInfo{
         .air_inst = inst,
@@ -2172,14 +2177,82 @@ fn airArg(self: *Self, inst: Air.Inst.Index) !void {
     if (self.liveness.isUnused(inst))
         return self.finishAirBookkeeping();
 
-    switch (mcv) {
-        .register => |reg| {
-            self.register_manager.getRegAssumeFree(reg.to64(), inst);
-        },
-        else => {},
-    }
+    const dst_mcv: MCValue = blk: {
+        switch (mcv) {
+            .register => |reg| {
+                self.register_manager.getRegAssumeFree(reg.to64(), inst);
+                break :blk mcv;
+            },
+            .stack_offset => |unadjusted_off| {
+                const ty = self.air.typeOfIndex(inst);
+                const abi_size = ty.abiSize(self.target.*);
+                const off = unadjusted_off + abi_size;
 
-    return self.finishAir(inst, mcv, .{ .none, .none, .none });
+                const recovered_rbp = try self.register_manager.allocReg(null, &.{});
+                const reloc = try self.addInst(.{
+                    .tag = .mov,
+                    .ops = (Mir.Ops{
+                        .reg1 = recovered_rbp.to64(),
+                        .reg2 = .rsp,
+                        .flags = 0b01,
+                    }).encode(),
+                    .data = .{ .imm = 0 }, // backpatched later
+                });
+                try self.stack_args_relocs.append(self.bin_file.allocator, reloc);
+
+                if (abi_size <= 8) {
+                    const reg = try self.register_manager.allocReg(inst, &.{recovered_rbp});
+                    _ = try self.addInst(.{
+                        .tag = .mov,
+                        .ops = (Mir.Ops{
+                            .reg1 = registerAlias(reg, @intCast(u32, abi_size)),
+                            .reg2 = recovered_rbp.to64(),
+                            .flags = 0b01,
+                        }).encode(),
+                        .data = .{ .imm = @bitCast(u32, -@intCast(i32, off)) },
+                    });
+                    break :blk .{ .register = reg };
+                }
+
+                // TODO copy ellision
+                const dst_mcv = try self.allocRegOrMem(inst, false);
+                const regs = try self.register_manager.allocRegs(
+                    3,
+                    .{ null, null, null },
+                    &.{ .rax, .rcx, recovered_rbp },
+                );
+                const addr_reg = regs[0];
+                const count_reg = regs[1];
+                const tmp_reg = regs[2];
+
+                try self.register_manager.getReg(.rax, null);
+                try self.register_manager.getReg(.rcx, null);
+
+                _ = try self.addInst(.{
+                    .tag = .lea,
+                    .ops = (Mir.Ops{
+                        .reg1 = addr_reg.to64(),
+                        .reg2 = recovered_rbp.to64(),
+                    }).encode(),
+                    .data = .{ .imm = @bitCast(u32, -@intCast(i32, off)) },
+                });
+
+                // TODO allow for abi_size to be u64
+                try self.genSetReg(Type.initTag(.u32), count_reg, .{ .immediate = @intCast(u32, abi_size) });
+                try self.genInlineMemcpy(
+                    @bitCast(u32, -@intCast(i32, dst_mcv.stack_offset + abi_size)),
+                    addr_reg.to64(),
+                    count_reg.to64(),
+                    tmp_reg.to8(),
+                );
+
+                break :blk dst_mcv;
+            },
+            else => unreachable,
+        }
+    };
+
+    return self.finishAir(inst, dst_mcv, .{ .none, .none, .none });
 }
 
 fn airBreakpoint(self: *Self) !void {
